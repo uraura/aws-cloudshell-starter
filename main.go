@@ -13,6 +13,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"os/signal"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -29,9 +30,12 @@ func init() {
 
 func main() {
 	profile := os.Getenv("AWS_PROFILE")
-	ctx := context.Background()
-	cfg := must(config.LoadDefaultConfig(ctx))
 
+	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
+	defer stop()
+
+	cfg := must(config.LoadDefaultConfig(ctx))
 	creds := must(cfg.Credentials.Retrieve(ctx))
 
 	hc := http.DefaultClient
