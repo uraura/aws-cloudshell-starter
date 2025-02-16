@@ -22,6 +22,39 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 )
 
+func main() {
+	profile := "dev" // TODO: use command line flag
+	ctx := context.Background()
+	cfg := must(config.LoadDefaultConfig(ctx, config.WithSharedConfigProfile(profile)))
+
+	creds := must(cfg.Credentials.Retrieve(ctx))
+
+	hc := http.DefaultClient
+	hc.Jar = must(cookiejar.New(nil))
+
+	awsLogin(ctx, hc, creds)
+	tbcreds := awsCloudShellCredential(ctx, cfg, hc, creds)
+	envID := awsCloudShellEnvironment(ctx, hc, tbcreds)
+	session := awsCloudShellSession(ctx, hc, tbcreds, envID)
+
+	fmt.Println("session-manager-plugin", "'"+session+"'", cfg.Region, "StartSession", profile)
+}
+
+func v4sign(ctx context.Context, creds aws.Credentials, req *http.Request) (*http.Request, error) {
+	bs := must(io.ReadAll(req.Body))
+	req.Body = io.NopCloser(strings.NewReader(string(bs)))
+
+	hash := sha256.Sum256(bs)
+
+	signer := v4.NewSigner()
+	must0(signer.SignHTTP(ctx, creds, req,
+		hex.EncodeToString(hash[:]),
+		"cloudshell", "ap-northeast-1" /* TODO: fix region */, time.Now()))
+	// sha256("{}") = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+
+	return req, nil
+}
+
 func must0(err error) {
 	if err != nil {
 		debug.PrintStack()
@@ -38,16 +71,7 @@ func must[T any](ret T, err error) T {
 	return ret
 }
 
-func main() {
-	profile := "dev" // TODO: use command line flag
-	ctx := context.Background()
-	cfg := must(config.LoadDefaultConfig(ctx, config.WithSharedConfigProfile(profile)))
-
-	creds := must(cfg.Credentials.Retrieve(ctx))
-
-	hc := http.DefaultClient
-	hc.Jar = must(cookiejar.New(nil))
-
+func awsLogin(ctx context.Context, hc *http.Client, creds aws.Credentials) {
 	signintokenURL := must(url.Parse("https://signin.aws.amazon.com/federation"))
 	signintokenURL.RawQuery = url.Values{
 		"Action":          []string{"getSigninToken"},
@@ -58,7 +82,8 @@ func main() {
 			"sessionToken": creds.SessionToken,
 		})))},
 	}.Encode()
-	signintoken := must(hc.Get(signintokenURL.String()))
+	req := must(http.NewRequestWithContext(ctx, http.MethodGet, signintokenURL.String(), io.NopCloser(strings.NewReader(""))))
+	signintoken := must(hc.Do(req))
 	defer signintoken.Body.Close()
 	body := must(io.ReadAll(signintoken.Body))
 	signintokenMap := make(map[string]string)
@@ -70,10 +95,13 @@ func main() {
 		"Destination": []string{"https://console.aws.amazon.com/console/home"},
 		"SigninToken": []string{signintokenMap["SigninToken"]},
 	}.Encode()
+	req = must(http.NewRequestWithContext(ctx, http.MethodGet, loginURL.String(), io.NopCloser(strings.NewReader(""))))
 	login := must(hc.Get(loginURL.String()))
 	defer login.Body.Close()
-	body = must(io.ReadAll(login.Body))
+	_ = must(io.ReadAll(login.Body))
+}
 
+func awsCloudShellCredential(ctx context.Context, cfg aws.Config, hc *http.Client, creds aws.Credentials) aws.Credentials {
 	consoleURLstr := ""
 	if cfg.Region == "us-east-1" {
 		consoleURLstr = "https://console.aws.amazon.com/cloudshell/home"
@@ -88,7 +116,7 @@ func main() {
 	}.Encode()
 	console := must(hc.Get(consoleURL.String()))
 	defer console.Body.Close()
-	body = must(io.ReadAll(console.Body))
+	body := must(io.ReadAll(console.Body))
 
 	startPos := strings.Index(string(body), `<meta name="tb-data" content="`)
 	endPos := strings.Index(string(body[startPos:]), `">`)
@@ -116,15 +144,17 @@ func main() {
 	tbcredsmap := make(map[string]string)
 	must0(json.Unmarshal(body, &tbcredsmap))
 
-	tbcreds := aws.Credentials{
+	return aws.Credentials{
 		AccessKeyID:     tbcredsmap["accessKeyId"],
 		SecretAccessKey: tbcredsmap["secretAccessKey"],
 		SessionToken:    tbcredsmap["sessionToken"],
 		Expires:         must(time.Parse(time.RFC3339, tbcredsmap["expiration"])),
 	}
+}
 
+func awsCloudShellEnvironment(ctx context.Context, hc *http.Client, tbcreds aws.Credentials) string {
 	// ???
-	req = must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/describeEnvironments",
+	req := must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/describeEnvironments",
 		io.NopCloser(strings.NewReader(""))))
 	res := must(hc.Do(must(v4sign(ctx, tbcreds, req))))
 	defer res.Body.Close()
@@ -167,9 +197,13 @@ func main() {
 		}()
 	}
 
-	req = must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/createSession",
+	return envID
+}
+
+func awsCloudShellSession(ctx context.Context, hc *http.Client, tbcreds aws.Credentials, envID string) string {
+	req := must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/createSession",
 		strings.NewReader(fmt.Sprintf(`{"EnvironmentId":"%s"}`, envID))))
-	res = must(hc.Do(must(v4sign(ctx, tbcreds, req))))
+	res := must(hc.Do(must(v4sign(ctx, tbcreds, req))))
 	defer res.Body.Close()
 	session := must(io.ReadAll(res.Body))
 	log.Printf("createSession %s\n", session)
@@ -184,11 +218,11 @@ func main() {
 	req = must(http.NewRequest(http.MethodGet, authURL.String(), io.NopCloser(strings.NewReader(""))))
 	res = must(hc.Do(must(v4sign(ctx, tbcreds, req))))
 	defer res.Body.Close()
-	bs = must(io.ReadAll(res.Body))
+	bs := must(io.ReadAll(res.Body))
 	//log.Printf("oauthEnvironment %s\n", bs)
 
-	startPos = strings.Index(string(bs), `main("`) + len(`main("`)
-	endPos = strings.Index(string(bs[startPos:]), `", `)
+	startPos := strings.Index(string(bs), `main("`) + len(`main("`)
+	endPos := strings.Index(string(bs[startPos:]), `", `)
 	oauthcode := string(bs[startPos : startPos+endPos])
 	log.Printf("oauthcode %s\n", oauthcode)
 
@@ -231,21 +265,5 @@ func main() {
 	bs = must(io.ReadAll(res.Body))
 	log.Printf("putCredentials %s\n", bs)
 
-	//cmd := exec.Command( "session-manager-plugin", string(session), cfg.Region, "StartSession")
-	fmt.Println("session-manager-plugin", "'"+string(session)+"'", cfg.Region, "StartSession", profile)
-}
-
-func v4sign(ctx context.Context, creds aws.Credentials, req *http.Request) (*http.Request, error) {
-	bs := must(io.ReadAll(req.Body))
-	req.Body = io.NopCloser(strings.NewReader(string(bs)))
-
-	hash := sha256.Sum256(bs)
-
-	signer := v4.NewSigner()
-	must0(signer.SignHTTP(ctx, creds, req,
-		hex.EncodeToString(hash[:]),
-		"cloudshell", "ap-northeast-1" /* TODO: fix region */, time.Now()))
-	// sha256("{}") = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
-
-	return req, nil
+	return string(session)
 }
