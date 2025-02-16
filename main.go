@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -22,10 +23,14 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 )
 
+func init() {
+	os.Setenv("AWS_SDK_LOAD_CONFIG", "1")
+}
+
 func main() {
-	profile := "dev" // TODO: use command line flag
+	profile := os.Getenv("AWS_PROFILE")
 	ctx := context.Background()
-	cfg := must(config.LoadDefaultConfig(ctx, config.WithSharedConfigProfile(profile)))
+	cfg := must(config.LoadDefaultConfig(ctx))
 
 	creds := must(cfg.Credentials.Retrieve(ctx))
 

@@ -9,7 +9,7 @@ It includes a simple go application that generates command to connect AWS CloudS
 * Run.
 
 ```shell
-$ eval $(./aws-cloudshell-starter)
+$ eval $(AWS_PROFILE=target ./aws-cloudshell-starter)
 
 Starting session with SessionId: 173968xxxxxx1191682-utrexample366dg8ozjf2urin8
 ~ $ whoami
