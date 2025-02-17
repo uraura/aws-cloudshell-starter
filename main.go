@@ -46,6 +46,7 @@ func main() {
 	envID := awsCloudShellEnvironment(ctx, hc, tbcreds)
 	session := awsCloudShellSession(ctx, hc, tbcreds, envID)
 
+	// https://github.com/aws/session-manager-plugin/blob/b2b0bcd769d1c0693f77047360748ed45b09a72b/src/sessionmanagerplugin/session/session.go#L121-L130
 	fmt.Println("session-manager-plugin", "'"+session+"'", cfg.Region, "StartSession", profile)
 }
 
@@ -172,7 +173,7 @@ func awsCloudShellEnvironment(ctx context.Context, hc *http.Client, tbcreds aws.
 
 	//fmt.Printf("%+v\n", tbcreds)
 	req = must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/createEnvironment",
-		io.NopCloser(strings.NewReader("{}"))))
+		io.NopCloser(strings.NewReader("{}")))) // TODO: vpc config https://github.com/iann0036/vscode-aws-cloudshell/blob/793c2831eba458e95926ba667fe33919ddafb975/src/extension.ts#L174-L200
 	res = must(hc.Do(must(v4sign(ctx, tbcreds, req))))
 	defer res.Body.Close()
 	bs = must(io.ReadAll(res.Body))
