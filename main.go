@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -28,8 +29,27 @@ func init() {
 	os.Setenv("AWS_SDK_LOAD_CONFIG", "1")
 }
 
+type vpcConfig struct {
+	VpcID            string   `json:"VpcId"`
+	SubnetIDs        []string `json:"SubnetIds"`
+	SecurityGroupIDs []string `json:"SecurityGroupIds"`
+}
+
+func (v *vpcConfig) IsValid() bool {
+	return v.VpcID != "" && len(v.SubnetIDs) > 0 && len(v.SecurityGroupIDs) > 0
+}
+
 func main() {
 	profile := os.Getenv("AWS_PROFILE")
+
+	var vpc vpcConfig
+	flag.StringVar(&vpc.VpcID, "vpc-id", "", "VPC ID")
+	var subnetIDs, securityGroupIDs string
+	flag.StringVar(&subnetIDs, "subnet-ids", "", "Subnet IDs")
+	flag.StringVar(&securityGroupIDs, "security-group-ids", "", "Security Group IDs")
+	flag.Parse()
+	vpc.SubnetIDs = strings.Split(subnetIDs, ",")
+	vpc.SecurityGroupIDs = strings.Split(securityGroupIDs, ",")
 
 	ctx := context.Background()
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
@@ -43,7 +63,7 @@ func main() {
 
 	awsLogin(ctx, hc, creds)
 	tbcreds := awsCloudShellCredential(ctx, cfg, hc, creds)
-	envID := awsCloudShellEnvironment(ctx, hc, tbcreds)
+	envID := awsCloudShellEnvironment(ctx, hc, tbcreds, vpc)
 	session := awsCloudShellSession(ctx, hc, tbcreds, envID)
 
 	// https://github.com/aws/session-manager-plugin/blob/b2b0bcd769d1c0693f77047360748ed45b09a72b/src/sessionmanagerplugin/session/session.go#L121-L130
@@ -162,7 +182,7 @@ func awsCloudShellCredential(ctx context.Context, cfg aws.Config, hc *http.Clien
 	}
 }
 
-func awsCloudShellEnvironment(ctx context.Context, hc *http.Client, tbcreds aws.Credentials) string {
+func awsCloudShellEnvironment(ctx context.Context, hc *http.Client, tbcreds aws.Credentials, vpc vpcConfig) string {
 	// ???
 	req := must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/describeEnvironments",
 		io.NopCloser(strings.NewReader(""))))
@@ -172,8 +192,13 @@ func awsCloudShellEnvironment(ctx context.Context, hc *http.Client, tbcreds aws.
 	log.Printf("describeEnvironments %s\n", bs)
 
 	//fmt.Printf("%+v\n", tbcreds)
-	req = must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/createEnvironment",
-		io.NopCloser(strings.NewReader("{}")))) // TODO: vpc config https://github.com/iann0036/vscode-aws-cloudshell/blob/793c2831eba458e95926ba667fe33919ddafb975/src/extension.ts#L174-L200
+	body := "{}"
+	if vpc.IsValid() {
+		log.Printf("use vpc config %+v\n", vpc)
+		log.Print("creating vpc-environment takes a few minutes")
+		body = string(must(json.Marshal(map[string]any{"VpcConfig": vpc, "EnvironmentName": "env-" + fmt.Sprint(time.Now().Unix())})))
+	}
+	req = must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/createEnvironment", io.NopCloser(strings.NewReader(body))))
 	res = must(hc.Do(must(v4sign(ctx, tbcreds, req))))
 	defer res.Body.Close()
 	bs = must(io.ReadAll(res.Body))
