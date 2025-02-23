@@ -51,7 +51,6 @@ Hello CloudShell!
 ### Custom initialization script
 You can use the `-init-script` option to specify a custom initialization script.
 This script will be executed in the CloudShell session.
-Useful for install tools, mount EFS/S3, etc.
 
 ```shell
 $ AWS_PROFILE=target ./aws-cloudshell-starter -init-script ./init.sh
@@ -62,6 +61,18 @@ Hello custom CloudShell!
 AWS Account ID: 1234567890XX
 IP Address: xx.xx.xx.xx
 cloudshell-user@ip-xx-xx-xx-xx:~$ 
+
+```
+
+#### example: mount s3 bucket
+You can mount s3 bucket using `mount-s3` command in initialization script.
+```shell
+# mount s3
+sudo yum -y -q install https://s3.amazonaws.com/mountpoint-s3-release/latest/x86_64/mount-s3.rpm
+sudo mkdir -p /mnt/work
+sudo chown cloudshell-user. /mnt/work
+mount-s3 <<target-bucket>> /mnt/work --allow-delete
+cd /mnt/work
 
 ```
 
