@@ -1,7 +1,5 @@
 # aws-cloudshell-starter
-
-This is a starter project for AWS CloudShell.
-It includes a simple go application that generates command to connect AWS CloudShell session.
+Connecting to AWS CloudShell from your terminal using AWS Systems Manager Session Manager.
 
 ## usage
 * Install awscli and session-manager-plugin.
