@@ -47,7 +47,7 @@ type awsCloudShellParams struct {
 	creds          aws.Credentials
 	envID          string
 	initScriptPath string
-	session        string
+	session        map[string]string
 	cfg            aws.Config
 	profile        string
 }
@@ -86,6 +86,7 @@ func main() {
 	envID := awsCloudShellEnvironment(ctx, hc, creds, vpc)
 	defer awsCloudShellEnvironmentCleanup(ctx, hc, creds, envID)
 	session := awsCloudShellSession(ctx, hc, creds, envID)
+	defer awsCloudShellSessionCleanup(ctx, hc, creds, envID, session["SessionId"])
 
 	awsCloudShell(ctx, awsCloudShellParams{
 		httpClient:     hc,
@@ -217,14 +218,22 @@ func awsCloudShellCredential(ctx context.Context, cfg aws.Config, hc *http.Clien
 	}
 }
 
-func awsCloudShellEnvironmentCleanup(ctx context.Context, hc *http.Client, tbcreds aws.Credentials, envID string) {
+func awsCloudShellEnvironmentCleanup(ctx context.Context, hc *http.Client, creds aws.Credentials, envID string) {
 	log.Printf("cleanup environment: %s", envID)
 	req := must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/deleteEnvironment",
 		io.NopCloser(strings.NewReader(fmt.Sprintf(`{"EnvironmentId":"%s"}`, envID)))))
-	res := must(hc.Do(must(v4sign(ctx, tbcreds, req))))
+	res := must(hc.Do(must(v4sign(ctx, creds, req))))
 	defer res.Body.Close()
-	bs := must(io.ReadAll(res.Body))
-	log.Printf("deleteEnvironment %s\n", bs)
+	//bs := must(io.ReadAll(res.Body))
+	//log.Printf("deleteEnvironment %s\n", bs)
+}
+
+func awsCloudShellSessionCleanup(ctx context.Context, hc *http.Client, creds aws.Credentials, envID, sessionID string) {
+	log.Printf("cleanup session: %s", sessionID)
+	req := must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/deleteSession",
+		io.NopCloser(strings.NewReader(fmt.Sprintf(`{"EnvironmentId":"%s", "SessionId":"%s"}`, envID, sessionID)))))
+	res := must(hc.Do(must(v4sign(ctx, creds, req))))
+	defer res.Body.Close()
 }
 
 func awsCloudShellEnvironment(ctx context.Context, hc *http.Client, tbcreds aws.Credentials, vpc vpcConfig) string {
@@ -280,7 +289,7 @@ func awsCloudShellEnvironment(ctx context.Context, hc *http.Client, tbcreds aws.
 	return envID
 }
 
-func awsCloudShellSession(ctx context.Context, hc *http.Client, tbcreds aws.Credentials, envID string) string {
+func awsCloudShellSession(ctx context.Context, hc *http.Client, tbcreds aws.Credentials, envID string) map[string]string {
 	req := must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/createSession",
 		strings.NewReader(fmt.Sprintf(`{"EnvironmentId":"%s"}`, envID))))
 	res := must(hc.Do(must(v4sign(ctx, tbcreds, req))))
@@ -345,7 +354,9 @@ func awsCloudShellSession(ctx context.Context, hc *http.Client, tbcreds aws.Cred
 	bs = must(io.ReadAll(res.Body))
 	//log.Printf("putCredentials %s\n", bs)
 
-	return string(session)
+	var ret map[string]string
+	must0(json.Unmarshal(session, &ret))
+	return ret
 }
 
 func awsCloudShellInit(ctx context.Context, hc *http.Client, creds aws.Credentials, envID string, initFilePath string) map[string]any {
@@ -396,11 +407,9 @@ func awsCloudShell(ctx context.Context, params awsCloudShellParams) {
 	}
 
 	// https://github.com/aws/session-manager-plugin/blob/b2b0bcd769d1c0693f77047360748ed45b09a72b/src/sessionmanagerplugin/session/session.go#L121-L130
-	cmd := exec.Command("session-manager-plugin", params.session, params.cfg.Region, "StartSession", params.profile)
-
-	// disable local echo
-	oldState := must(term.MakeRaw(int(os.Stdin.Fd())))
-	defer term.Restore(int(os.Stdin.Fd()), oldState)
+	cmdctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(cmdctx, "session-manager-plugin", string(must(json.Marshal(params.session))), params.cfg.Region, "StartSession", params.profile)
+	defer cancel()
 
 	initcmd := "echo Hello CloudShell!\n"
 	if len(initMap) > 0 {
@@ -415,5 +424,11 @@ func awsCloudShell(ctx context.Context, params awsCloudShellParams) {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
+	// disable local echo
+	oldState := must(term.MakeRaw(int(os.Stdin.Fd())))
+	defer term.Restore(int(os.Stdin.Fd()), oldState)
+
 	cmd.Run()
+	term.Restore(int(os.Stdin.Fd()), oldState)
+	println()
 }
