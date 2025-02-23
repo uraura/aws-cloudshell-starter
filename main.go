@@ -42,6 +42,16 @@ func (v *vpcConfig) IsValid() bool {
 	return v.VpcID != "" && len(v.SubnetIDs) > 0 && len(v.SecurityGroupIDs) > 0
 }
 
+type awsCloudShellParams struct {
+	httpClient     *http.Client
+	creds          aws.Credentials
+	envID          string
+	initScriptPath string
+	session        string
+	cfg            aws.Config
+	profile        string
+}
+
 func main() {
 	profile := os.Getenv("AWS_PROFILE")
 	log.Printf("profile %s\n", profile)
@@ -68,6 +78,7 @@ func main() {
 	hc := http.DefaultClient
 	hc.Jar = must(cookiejar.New(nil))
 
+	// get login cookie
 	awsLogin(ctx, hc, creds)
 	// TODO: not needed?
 	//tbcreds := awsCloudShellCredential(ctx, cfg, hc, creds)
@@ -75,35 +86,16 @@ func main() {
 	envID := awsCloudShellEnvironment(ctx, hc, creds, vpc)
 	defer awsCloudShellEnvironmentCleanup(ctx, hc, creds, envID)
 	session := awsCloudShellSession(ctx, hc, creds, envID)
-	log.Printf("session %s\n", session)
 
-	initMap := make(map[string]any)
-	if initScriptPath != "" {
-		initMap = awsCloudShellInit(ctx, hc, creds, envID, initScriptPath)
-		log.Printf("initMap %v\n", initMap)
-	}
-
-	// https://github.com/aws/session-manager-plugin/blob/b2b0bcd769d1c0693f77047360748ed45b09a72b/src/sessionmanagerplugin/session/session.go#L121-L130
-	cmd := exec.Command("session-manager-plugin", session, cfg.Region, "StartSession", profile)
-
-	// disable local echo
-	oldState := must(term.MakeRaw(int(os.Stdin.Fd())))
-	defer term.Restore(int(os.Stdin.Fd()), oldState)
-
-	initcmd := "echo Hello CloudShell!\n"
-	if len(initMap) > 0 {
-		initcmd = fmt.Sprintf("source <(curl -sSL -H 'x-amz-server-side-encryption-customer-key: %v' '%v')\n", initMap["FileDownloadPresignedKey"], initMap["FileDownloadPresignedUrl"])
-	}
-
-	in := io.MultiReader(
-		strings.NewReader(initcmd),
-		os.Stdin,
-	)
-	cmd.Stdin = in
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	cmd.Run()
+	awsCloudShell(ctx, awsCloudShellParams{
+		httpClient:     hc,
+		creds:          creds,
+		envID:          envID,
+		initScriptPath: initScriptPath,
+		session:        session,
+		cfg:            cfg,
+		profile:        profile,
+	})
 }
 
 func v4sign(ctx context.Context, creds aws.Credentials, req *http.Request) (*http.Request, error) {
@@ -312,7 +304,7 @@ func awsCloudShellSession(ctx context.Context, hc *http.Client, tbcreds aws.Cred
 	startPos := strings.Index(string(bs), `main("`) + len(`main("`)
 	endPos := strings.Index(string(bs[startPos:]), `", `)
 	oauthcode := string(bs[startPos : startPos+endPos])
-	log.Printf("oauthcode %s\n", oauthcode)
+	//log.Printf("oauthcode %s\n", oauthcode)
 
 	authcookies := hc.Jar.Cookies(must(url.Parse("https://auth.cloudshell.ap-northeast-1.aws.amazon.com/")))
 	keybase := ""
@@ -325,7 +317,7 @@ func awsCloudShellSession(ctx context.Context, hc *http.Client, tbcreds aws.Cred
 		must0(json.Unmarshal([]byte(must(url.QueryUnescape(c.Value))), &userInfo))
 		keybase = userInfo["keybase"].(string)
 	}
-	log.Printf("keybase %s\n", keybase)
+	//log.Printf("keybase %s\n", keybase)
 
 	req = must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/redeemCode",
 		io.NopCloser(bytes.NewReader(must(json.Marshal(map[string]string{
@@ -338,7 +330,7 @@ func awsCloudShellSession(ctx context.Context, hc *http.Client, tbcreds aws.Cred
 	res = must(hc.Do(must(v4sign(ctx, tbcreds, req))))
 	defer res.Body.Close()
 	bs = must(io.ReadAll(res.Body))
-	log.Printf("redeemCode %s\n", bs)
+	//log.Printf("redeemCode %s\n", bs)
 	redeemcodemap := make(map[string]string)
 	must0(json.Unmarshal(bs, &redeemcodemap))
 
@@ -351,7 +343,7 @@ func awsCloudShellSession(ctx context.Context, hc *http.Client, tbcreds aws.Cred
 	res = must(hc.Do(must(v4sign(ctx, tbcreds, req))))
 	defer res.Body.Close()
 	bs = must(io.ReadAll(res.Body))
-	log.Printf("putCredentials %s\n", bs)
+	//log.Printf("putCredentials %s\n", bs)
 
 	return string(session)
 }
@@ -394,4 +386,34 @@ func awsCloudShellInit(ctx context.Context, hc *http.Client, creds aws.Credentia
 	//log.Printf("init command:")
 	//return fmt.Sprintf(`curl -s -H 'x-amz-server-side-encryption-customer-key: %v' '%v' | bash`, uploadInfoMap["FileDownloadPresignedKey"], uploadInfoMap["FileDownloadPresignedUrl"])
 	return uploadInfoMap
+}
+
+func awsCloudShell(ctx context.Context, params awsCloudShellParams) {
+	initMap := make(map[string]any)
+	if params.initScriptPath != "" {
+		initMap = awsCloudShellInit(ctx, params.httpClient, params.creds, params.envID, params.initScriptPath)
+		log.Printf("initMap %v\n", initMap)
+	}
+
+	// https://github.com/aws/session-manager-plugin/blob/b2b0bcd769d1c0693f77047360748ed45b09a72b/src/sessionmanagerplugin/session/session.go#L121-L130
+	cmd := exec.Command("session-manager-plugin", params.session, params.cfg.Region, "StartSession", params.profile)
+
+	// disable local echo
+	oldState := must(term.MakeRaw(int(os.Stdin.Fd())))
+	defer term.Restore(int(os.Stdin.Fd()), oldState)
+
+	initcmd := "echo Hello CloudShell!\n"
+	if len(initMap) > 0 {
+		initcmd = fmt.Sprintf("source <(curl -sSL -H 'x-amz-server-side-encryption-customer-key: %v' '%v')\n", initMap["FileDownloadPresignedKey"], initMap["FileDownloadPresignedUrl"])
+	}
+
+	in := io.MultiReader(
+		strings.NewReader(initcmd),
+		os.Stdin,
+	)
+	cmd.Stdin = in
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	cmd.Run()
 }
