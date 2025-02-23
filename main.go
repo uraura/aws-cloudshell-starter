@@ -10,10 +10,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"runtime/debug"
 	"strings"
@@ -23,6 +25,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"golang.org/x/term"
 )
 
 func init() {
@@ -41,6 +44,10 @@ func (v *vpcConfig) IsValid() bool {
 
 func main() {
 	profile := os.Getenv("AWS_PROFILE")
+	log.Printf("profile %s\n", profile)
+
+	var initScriptPath string
+	flag.StringVar(&initScriptPath, "init-script", "", "init script path")
 
 	var vpc vpcConfig
 	flag.StringVar(&vpc.VpcID, "vpc-id", "", "VPC ID")
@@ -62,12 +69,41 @@ func main() {
 	hc.Jar = must(cookiejar.New(nil))
 
 	awsLogin(ctx, hc, creds)
-	tbcreds := awsCloudShellCredential(ctx, cfg, hc, creds)
-	envID := awsCloudShellEnvironment(ctx, hc, tbcreds, vpc)
-	session := awsCloudShellSession(ctx, hc, tbcreds, envID)
+	// TODO: not needed?
+	//tbcreds := awsCloudShellCredential(ctx, cfg, hc, creds)
+	//log.Printf("tbcreds %s\n", tbcreds)
+	envID := awsCloudShellEnvironment(ctx, hc, creds, vpc)
+	defer awsCloudShellEnvironmentCleanup(ctx, hc, creds, envID)
+	session := awsCloudShellSession(ctx, hc, creds, envID)
+	log.Printf("session %s\n", session)
+
+	initMap := make(map[string]any)
+	if initScriptPath != "" {
+		initMap = awsCloudShellInit(ctx, hc, creds, envID, initScriptPath)
+		log.Printf("initMap %v\n", initMap)
+	}
 
 	// https://github.com/aws/session-manager-plugin/blob/b2b0bcd769d1c0693f77047360748ed45b09a72b/src/sessionmanagerplugin/session/session.go#L121-L130
-	fmt.Println("session-manager-plugin", "'"+session+"'", cfg.Region, "StartSession", profile)
+	cmd := exec.Command("session-manager-plugin", session, cfg.Region, "StartSession", profile)
+
+	// disable local echo
+	oldState := must(term.MakeRaw(int(os.Stdin.Fd())))
+	defer term.Restore(int(os.Stdin.Fd()), oldState)
+
+	initcmd := "echo Hello CloudShell!\n"
+	if len(initMap) > 0 {
+		initcmd = fmt.Sprintf("source <(curl -sSL -H 'x-amz-server-side-encryption-customer-key: %v' '%v')\n", initMap["FileDownloadPresignedKey"], initMap["FileDownloadPresignedUrl"])
+	}
+
+	in := io.MultiReader(
+		strings.NewReader(initcmd),
+		os.Stdin,
+	)
+	cmd.Stdin = in
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	cmd.Run()
 }
 
 func v4sign(ctx context.Context, creds aws.Credentials, req *http.Request) (*http.Request, error) {
@@ -96,6 +132,13 @@ func must[T any](ret T, err error) T {
 	if err != nil {
 		debug.PrintStack()
 		log.Fatal(err)
+	}
+
+	if r, ok := any(ret).(*http.Response); ok {
+		if r.StatusCode >= 400 {
+			debug.PrintStack()
+			log.Fatalf("request failed. status code %d", r.StatusCode)
+		}
 	}
 
 	return ret
@@ -180,6 +223,16 @@ func awsCloudShellCredential(ctx context.Context, cfg aws.Config, hc *http.Clien
 		SessionToken:    tbcredsmap["sessionToken"],
 		Expires:         must(time.Parse(time.RFC3339, tbcredsmap["expiration"])),
 	}
+}
+
+func awsCloudShellEnvironmentCleanup(ctx context.Context, hc *http.Client, tbcreds aws.Credentials, envID string) {
+	log.Printf("cleanup environment: %s", envID)
+	req := must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/deleteEnvironment",
+		io.NopCloser(strings.NewReader(fmt.Sprintf(`{"EnvironmentId":"%s"}`, envID)))))
+	res := must(hc.Do(must(v4sign(ctx, tbcreds, req))))
+	defer res.Body.Close()
+	bs := must(io.ReadAll(res.Body))
+	log.Printf("deleteEnvironment %s\n", bs)
 }
 
 func awsCloudShellEnvironment(ctx context.Context, hc *http.Client, tbcreds aws.Credentials, vpc vpcConfig) string {
@@ -301,4 +354,44 @@ func awsCloudShellSession(ctx context.Context, hc *http.Client, tbcreds aws.Cred
 	log.Printf("putCredentials %s\n", bs)
 
 	return string(session)
+}
+
+func awsCloudShellInit(ctx context.Context, hc *http.Client, creds aws.Credentials, envID string, initFilePath string) map[string]any {
+	req := must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/getFileUploadUrls",
+		io.NopCloser(bytes.NewReader(must(json.Marshal(map[string]string{
+			"EnvironmentId":  envID,
+			"FileUploadPath": initFilePath,
+		}))))))
+	res := must(hc.Do(must(v4sign(ctx, creds, req))))
+	defer res.Body.Close()
+	bs := must(io.ReadAll(res.Body))
+	uploadInfoMap := make(map[string]any)
+	must0(json.Unmarshal(bs, &uploadInfoMap))
+	//log.Printf("getFileUploadUrls %s\n", uploadInfoMap)
+
+	// upload
+	fieldname := "file"
+	filename := initFilePath
+	file := must(os.Open(filename))
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	for k, v := range uploadInfoMap["FileUploadPresignedFields"].(map[string]any) {
+		//log.Printf("%s %s\n", k, v.(string))
+		must0(mw.WriteField(k, v.(string)))
+	}
+	fw := must(mw.CreateFormFile(fieldname, filename))
+	must(io.Copy(fw, file))
+	contentType := mw.FormDataContentType()
+	must0(mw.Close())
+	req = must(http.NewRequest(http.MethodPost, uploadInfoMap["FileUploadPresignedUrl"].(string), body))
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Content-Length", fmt.Sprint(body.Len()))
+	//dr := must(httputil.DumpRequest(req, true))
+	//log.Printf("dump %v\n", string(dr))
+	res = must(hc.Do(req))
+	defer res.Body.Close()
+	bs = must(io.ReadAll(res.Body))
+	//log.Printf("init command:")
+	//return fmt.Sprintf(`curl -s -H 'x-amz-server-side-encryption-customer-key: %v' '%v' | bash`, uploadInfoMap["FileDownloadPresignedKey"], uploadInfoMap["FileDownloadPresignedUrl"])
+	return uploadInfoMap
 }

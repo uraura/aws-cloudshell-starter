@@ -10,18 +10,22 @@ It includes a simple go application that generates command to connect AWS CloudS
 
 ### Non-VPC environment
 ```shell
-$ eval $(AWS_PROFILE=target ./aws-cloudshell-starter)
-
+$ AWS_PROFILE=target ./aws-cloudshell-starter
+...
 Starting session with SessionId: 173968xxxxxx1191682-utrexample366dg8ozjf2urin8
+~ $ echo Hello CloudShell!
+Hello CloudShell!
 ~ $ whoami
 cloudshell-user
 ```
 
 ### VPC environment
 ```shell
-$ eval $(AWS_PROFILE=target ./aws-cloudshell-starter -vpc-id vpc-xxxx -subnet-ids subnet-xxxx,subnet-yyyy -security-group-ids sg-xxxx,sg-yyyy,sg-zzzz)
-
+$ AWS_PROFILE=target ./aws-cloudshell-starter -vpc-id vpc-xxxx -subnet-ids subnet-xxxx,subnet-yyyy -security-group-ids sg-xxxx,sg-yyyy,sg-zzzz
+...
 Starting session with SessionId: 174017xxxxxx5437987-4fzjq9yipyritexamp1e9ycnda
+~ $ echo Hello CloudShell!
+Hello CloudShell!
 ~ $ ip a
 1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000
     link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
@@ -42,6 +46,23 @@ Starting session with SessionId: 174017xxxxxx5437987-4fzjq9yipyritexamp1e9ycnda
     link/ether de:59:33:ea:52:8d brd ff:ff:ff:ff:ff:ff link-netnsid 0
     inet 192.168.0.2/32 scope global devfile-veth0
        valid_lft forever preferred_lft forever
+```
+
+### Custom initialization script
+You can use the `-init-script` option to specify a custom initialization script.
+This script will be executed in the CloudShell session.
+Useful for install tools, mount EFS/S3, etc.
+
+```shell
+$ AWS_PROFILE=target ./aws-cloudshell-starter -init-script ./init.sh
+...
+Starting session with SessionId: 1740296564950814169-cpkoexAmp1Epxls74bbvzxe9h4
+~ $ source <(curl -s -H 'x-amz-server-side-encryption-customer-key: OBYg97D3+5ExamPLeI/7WRry4uOyeXaMp1e+JsKirnI=' 'https://...(presigned url)...') 
+Hello custom CloudShell!
+AWS Account ID: 1234567890XX
+IP Address: xx.xx.xx.xx
+cloudshell-user@ip-xx-xx-xx-xx:~$ 
+
 ```
 
 references: https://github.com/iann0036/vscode-aws-cloudshell
