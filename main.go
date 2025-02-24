@@ -84,9 +84,9 @@ func main() {
 	//tbcreds := awsCloudShellCredential(ctx, cfg, hc, creds)
 	//log.Printf("tbcreds %s\n", tbcreds)
 	envID := awsCloudShellEnvironment(ctx, hc, creds, vpc)
-	defer awsCloudShellEnvironmentCleanup(ctx, hc, creds, envID)
+	defer awsCloudShellEnvironmentCleanup(ctx, hc, cfg, envID)
 	session := awsCloudShellSession(ctx, hc, creds, envID)
-	defer awsCloudShellSessionCleanup(ctx, hc, creds, envID, session["SessionId"])
+	defer awsCloudShellSessionCleanup(ctx, hc, cfg, envID, session["SessionId"])
 
 	awsCloudShell(ctx, awsCloudShellParams{
 		httpClient:     hc,
@@ -218,8 +218,9 @@ func awsCloudShellCredential(ctx context.Context, cfg aws.Config, hc *http.Clien
 	}
 }
 
-func awsCloudShellEnvironmentCleanup(ctx context.Context, hc *http.Client, creds aws.Credentials, envID string) {
+func awsCloudShellEnvironmentCleanup(ctx context.Context, hc *http.Client, cfg aws.Config, envID string) {
 	log.Printf("cleanup environment: %s", envID)
+	creds := must(cfg.Credentials.Retrieve(ctx))
 	req := must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/deleteEnvironment",
 		io.NopCloser(strings.NewReader(fmt.Sprintf(`{"EnvironmentId":"%s"}`, envID)))))
 	res := must(hc.Do(must(v4sign(ctx, creds, req))))
@@ -228,8 +229,9 @@ func awsCloudShellEnvironmentCleanup(ctx context.Context, hc *http.Client, creds
 	//log.Printf("deleteEnvironment %s\n", bs)
 }
 
-func awsCloudShellSessionCleanup(ctx context.Context, hc *http.Client, creds aws.Credentials, envID, sessionID string) {
+func awsCloudShellSessionCleanup(ctx context.Context, hc *http.Client, cfg aws.Config, envID, sessionID string) {
 	log.Printf("cleanup session: %s", sessionID)
+	creds := must(cfg.Credentials.Retrieve(ctx))
 	req := must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/deleteSession",
 		io.NopCloser(strings.NewReader(fmt.Sprintf(`{"EnvironmentId":"%s", "SessionId":"%s"}`, envID, sessionID)))))
 	res := must(hc.Do(must(v4sign(ctx, creds, req))))
@@ -297,63 +299,6 @@ func awsCloudShellSession(ctx context.Context, hc *http.Client, tbcreds aws.Cred
 	session := must(io.ReadAll(res.Body))
 	log.Printf("createSession %s\n", session)
 
-	// 	path: "/oauth?EnvironmentId=" + csEnvironment.data.EnvironmentId + "&codeVerifier=R0r-XINZhRJqEkRk-2EjocwI2aqrhcjO6IlGRPYcIo0&redirectUri=" + encodeURIComponent('https://auth.cloudshell.' + awsregion + '.aws.amazon.com/callback.js?state=1')
-	authURL := must(url.Parse("https://auth.cloudshell.ap-northeast-1.aws.amazon.com/oauth"))
-	authURL.RawQuery = url.Values{
-		"EnvironmentId": []string{envID},
-		"codeVerifier":  []string{"R0r-XINZhRJqEkRk-2EjocwI2aqrhcjO6IlGRPYcIo0"},
-		"redirectUri":   []string{"https://auth.cloudshell.ap-northeast-1.aws.amazon.com/callback.js?state=1"},
-	}.Encode()
-	req = must(http.NewRequest(http.MethodGet, authURL.String(), io.NopCloser(strings.NewReader(""))))
-	res = must(hc.Do(must(v4sign(ctx, tbcreds, req))))
-	defer res.Body.Close()
-	bs := must(io.ReadAll(res.Body))
-	//log.Printf("oauthEnvironment %s\n", bs)
-
-	startPos := strings.Index(string(bs), `main("`) + len(`main("`)
-	endPos := strings.Index(string(bs[startPos:]), `", `)
-	oauthcode := string(bs[startPos : startPos+endPos])
-	//log.Printf("oauthcode %s\n", oauthcode)
-
-	authcookies := hc.Jar.Cookies(must(url.Parse("https://auth.cloudshell.ap-northeast-1.aws.amazon.com/")))
-	keybase := ""
-	for _, c := range authcookies {
-		//log.Printf("authcookie %s\n", c)
-		if c.Name != "aws-userInfo" {
-			continue
-		}
-		var userInfo map[string]any
-		must0(json.Unmarshal([]byte(must(url.QueryUnescape(c.Value))), &userInfo))
-		keybase = userInfo["keybase"].(string)
-	}
-	//log.Printf("keybase %s\n", keybase)
-
-	req = must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/redeemCode",
-		io.NopCloser(bytes.NewReader(must(json.Marshal(map[string]string{
-			"AuthCode":      oauthcode,
-			"CodeVerifier":  "cfd87ed2-16b3-432e-8278-e3afdfc6b235c1a6b90c-33e3-43a6-9801-02d742274b9c",
-			"EnvironmentId": envID,
-			"KeyBase":       keybase,
-			"RedirectUri":   "https://auth.cloudshell.ap-northeast-1.aws.amazon.com/callback.js?state=1",
-		}))))))
-	res = must(hc.Do(must(v4sign(ctx, tbcreds, req))))
-	defer res.Body.Close()
-	bs = must(io.ReadAll(res.Body))
-	//log.Printf("redeemCode %s\n", bs)
-	redeemcodemap := make(map[string]string)
-	must0(json.Unmarshal(bs, &redeemcodemap))
-
-	req = must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/putCredentials",
-		io.NopCloser(bytes.NewReader(must(json.Marshal(map[string]string{
-			"EnvironmentId": envID,
-			"KeyBase":       keybase,
-			"RefreshToken":  redeemcodemap["RefreshToken"],
-		}))))))
-	res = must(hc.Do(must(v4sign(ctx, tbcreds, req))))
-	defer res.Body.Close()
-	bs = must(io.ReadAll(res.Body))
-	//log.Printf("putCredentials %s\n", bs)
-
 	var ret map[string]string
 	must0(json.Unmarshal(session, &ret))
 	return ret
@@ -399,7 +344,88 @@ func awsCloudShellInit(ctx context.Context, hc *http.Client, creds aws.Credentia
 	return uploadInfoMap
 }
 
+func heartbeat(ctx context.Context, params awsCloudShellParams) {
+	// renew creds
+	creds := must(params.cfg.Credentials.Retrieve(ctx))
+	//log.Printf("retrieved credentials: access_key_id=%v expiration=%v", creds.AccessKeyID, creds.Expires)
+	req := must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/sendHeartBeat",
+		io.NopCloser(strings.NewReader(fmt.Sprintf(`{"EnvironmentId":"%s"}`, params.envID)))))
+	res := must(params.httpClient.Do(must(v4sign(ctx, creds, req))))
+	defer res.Body.Close()
+
+	authURL := must(url.Parse("https://auth.cloudshell.ap-northeast-1.aws.amazon.com/oauth"))
+	authURL.RawQuery = url.Values{
+		"EnvironmentId": []string{params.envID},
+		"codeVerifier":  []string{"R0r-XINZhRJqEkRk-2EjocwI2aqrhcjO6IlGRPYcIo0"},
+		"redirectUri":   []string{"https://auth.cloudshell.ap-northeast-1.aws.amazon.com/callback.js?state=1"},
+	}.Encode()
+	req = must(http.NewRequest(http.MethodGet, authURL.String(), io.NopCloser(strings.NewReader(""))))
+	res = must(params.httpClient.Do(must(v4sign(ctx, creds, req))))
+	defer res.Body.Close()
+	bs := must(io.ReadAll(res.Body))
+	//log.Printf("oauthEnvironment %s\n", bs)
+
+	startPos := strings.Index(string(bs), `main("`) + len(`main("`)
+	endPos := strings.Index(string(bs[startPos:]), `", `)
+	oauthcode := string(bs[startPos : startPos+endPos])
+	//log.Printf("oauthcode %s\n", oauthcode)
+
+	authcookies := params.httpClient.Jar.Cookies(must(url.Parse("https://auth.cloudshell.ap-northeast-1.aws.amazon.com/")))
+	keybase := ""
+	for _, c := range authcookies {
+		//log.Printf("authcookie %s\n", c)
+		if c.Name != "aws-userInfo" {
+			continue
+		}
+		var userInfo map[string]any
+		must0(json.Unmarshal([]byte(must(url.QueryUnescape(c.Value))), &userInfo))
+		keybase = userInfo["keybase"].(string)
+	}
+	//log.Printf("keybase %s\n", keybase)
+
+	req = must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/redeemCode",
+		io.NopCloser(bytes.NewReader(must(json.Marshal(map[string]string{
+			"AuthCode":      oauthcode,
+			"CodeVerifier":  "cfd87ed2-16b3-432e-8278-e3afdfc6b235c1a6b90c-33e3-43a6-9801-02d742274b9c",
+			"EnvironmentId": params.envID,
+			"KeyBase":       keybase,
+			"RedirectUri":   "https://auth.cloudshell.ap-northeast-1.aws.amazon.com/callback.js?state=1",
+		}))))))
+	res = must(params.httpClient.Do(must(v4sign(ctx, creds, req))))
+	defer res.Body.Close()
+	bs = must(io.ReadAll(res.Body))
+	//log.Printf("redeemCode %s\n", bs)
+	redeemcodemap := make(map[string]string)
+	must0(json.Unmarshal(bs, &redeemcodemap))
+
+	req = must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/putCredentials",
+		io.NopCloser(bytes.NewReader(must(json.Marshal(map[string]string{
+			"EnvironmentId": params.envID,
+			"KeyBase":       keybase,
+			"RefreshToken":  redeemcodemap["RefreshToken"],
+		}))))))
+	res = must(params.httpClient.Do(must(v4sign(ctx, creds, req))))
+	defer res.Body.Close()
+	bs = must(io.ReadAll(res.Body))
+}
+
 func awsCloudShell(ctx context.Context, params awsCloudShellParams) {
+	go func(ctx context.Context) {
+		log.Printf("start sending heartbeat")
+		heartbeat(ctx, params)
+		ticker := time.NewTicker(45 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case _ = <-ticker.C:
+				//log.Printf("send heartbeat at %v", c)
+				heartbeat(ctx, params)
+			}
+		}
+	}(ctx)
+
 	initMap := make(map[string]any)
 	if params.initScriptPath != "" {
 		initMap = awsCloudShellInit(ctx, params.httpClient, params.creds, params.envID, params.initScriptPath)
