@@ -9,7 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"net/http/cookiejar"
@@ -52,9 +52,13 @@ type awsCloudShellParams struct {
 	profile        string
 }
 
+var logger = slog.Default()
+
 func main() {
 	profile := os.Getenv("AWS_PROFILE")
-	log.Printf("profile %s\n", profile)
+
+	var isDebug bool
+	flag.BoolVar(&isDebug, "debug", false, "debug mode")
 
 	var initScriptPath string
 	flag.StringVar(&initScriptPath, "init-script", "", "init script path")
@@ -65,6 +69,9 @@ func main() {
 	flag.StringVar(&subnetIDs, "subnet-ids", "", "Subnet IDs")
 	flag.StringVar(&securityGroupIDs, "security-group-ids", "", "Security Group IDs")
 	flag.Parse()
+	if isDebug {
+		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	}
 	vpc.SubnetIDs = strings.Split(subnetIDs, ",")
 	vpc.SecurityGroupIDs = strings.Split(securityGroupIDs, ",")
 
@@ -116,21 +123,21 @@ func v4sign(ctx context.Context, creds aws.Credentials, req *http.Request) (*htt
 
 func must0(err error) {
 	if err != nil {
-		debug.PrintStack()
-		log.Fatal(err)
+		logger.Error("error must be nil", slog.Any("err", err), slog.Any("stack", string(debug.Stack())))
+		panic(err)
 	}
 }
 
 func must[T any](ret T, err error) T {
 	if err != nil {
-		debug.PrintStack()
-		log.Fatal(err)
+		logger.Error("error must be nil", slog.Any("err", err), slog.Any("stack", string(debug.Stack())))
+		panic(err)
 	}
 
 	if r, ok := any(ret).(*http.Response); ok {
 		if r.StatusCode >= 400 {
-			debug.PrintStack()
-			log.Fatalf("request failed. status code %d", r.StatusCode)
+			logger.Error("response status must be 2xx or 3xx", slog.Int("statusCode", r.StatusCode), slog.Any("body", must(io.ReadAll(r.Body))))
+			panic(fmt.Errorf("response status must be 2xx or 3xx: %d", r.StatusCode))
 		}
 	}
 
@@ -219,7 +226,7 @@ func awsCloudShellCredential(ctx context.Context, cfg aws.Config, hc *http.Clien
 }
 
 func awsCloudShellEnvironmentCleanup(ctx context.Context, hc *http.Client, cfg aws.Config, envID string) {
-	log.Printf("cleanup environment: %s", envID)
+	slog.InfoContext(ctx, "cleanup environment", slog.String("envID", envID))
 	creds := must(cfg.Credentials.Retrieve(ctx))
 	req := must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/deleteEnvironment",
 		io.NopCloser(strings.NewReader(fmt.Sprintf(`{"EnvironmentId":"%s"}`, envID)))))
@@ -230,7 +237,7 @@ func awsCloudShellEnvironmentCleanup(ctx context.Context, hc *http.Client, cfg a
 }
 
 func awsCloudShellSessionCleanup(ctx context.Context, hc *http.Client, cfg aws.Config, envID, sessionID string) {
-	log.Printf("cleanup session: %s", sessionID)
+	slog.InfoContext(ctx, "cleanup session", slog.String("sessionID", sessionID))
 	creds := must(cfg.Credentials.Retrieve(ctx))
 	req := must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/deleteSession",
 		io.NopCloser(strings.NewReader(fmt.Sprintf(`{"EnvironmentId":"%s", "SessionId":"%s"}`, envID, sessionID)))))
@@ -245,20 +252,19 @@ func awsCloudShellEnvironment(ctx context.Context, hc *http.Client, tbcreds aws.
 	res := must(hc.Do(must(v4sign(ctx, tbcreds, req))))
 	defer res.Body.Close()
 	bs := must(io.ReadAll(res.Body))
-	log.Printf("describeEnvironments %s\n", bs)
 
 	//fmt.Printf("%+v\n", tbcreds)
 	body := "{}"
 	if vpc.IsValid() {
-		log.Printf("use vpc config %+v\n", vpc)
-		log.Print("creating vpc-environment takes a few minutes")
+		slog.DebugContext(ctx, "use vpc config", slog.Any("vpc", vpc))
+		slog.InfoContext(ctx, "creating vpc-environment takes a few minutes")
 		body = string(must(json.Marshal(map[string]any{"VpcConfig": vpc, "EnvironmentName": "env-" + fmt.Sprint(time.Now().Unix())})))
 	}
 	req = must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/createEnvironment", io.NopCloser(strings.NewReader(body))))
 	res = must(hc.Do(must(v4sign(ctx, tbcreds, req))))
 	defer res.Body.Close()
 	bs = must(io.ReadAll(res.Body))
-	log.Printf("createEnvironment %s\n", bs)
+	slog.DebugContext(ctx, "createEnvironment", slog.String("body", string(bs)))
 	envmap := make(map[string]any)
 	must0(json.Unmarshal(bs, &envmap))
 
@@ -273,7 +279,7 @@ func awsCloudShellEnvironment(ctx context.Context, hc *http.Client, tbcreds aws.
 				res = must(hc.Do(must(v4sign(ctx, tbcreds, req))))
 				defer res.Body.Close()
 				bs = must(io.ReadAll(res.Body))
-				log.Printf("startEnvironment %s\n", bs)
+				slog.DebugContext(ctx, "startEnvironment", slog.String("body", string(bs)))
 				must0(json.Unmarshal(bs, &envmap))
 			})
 
@@ -282,7 +288,7 @@ func awsCloudShellEnvironment(ctx context.Context, hc *http.Client, tbcreds aws.
 			res = must(hc.Do(must(v4sign(ctx, tbcreds, req))))
 			defer res.Body.Close()
 			bs = must(io.ReadAll(res.Body))
-			log.Printf("getEnvironmentStatus %s\n", bs)
+			slog.DebugContext(ctx, "getEnvironmentStatus", slog.String("body", string(bs)))
 			must0(json.Unmarshal(bs, &envmap))
 			status = envmap["Status"].(string)
 		}()
@@ -297,7 +303,7 @@ func awsCloudShellSession(ctx context.Context, hc *http.Client, tbcreds aws.Cred
 	res := must(hc.Do(must(v4sign(ctx, tbcreds, req))))
 	defer res.Body.Close()
 	session := must(io.ReadAll(res.Body))
-	log.Printf("createSession %s\n", session)
+	slog.DebugContext(ctx, "createSession", slog.String("session", string(session)))
 
 	var ret map[string]string
 	must0(json.Unmarshal(session, &ret))
@@ -411,7 +417,7 @@ func heartbeat(ctx context.Context, params awsCloudShellParams) {
 
 func awsCloudShell(ctx context.Context, params awsCloudShellParams) {
 	go func(ctx context.Context) {
-		log.Printf("start sending heartbeat")
+		logger.DebugContext(ctx, "start sending heartbeat")
 		heartbeat(ctx, params)
 		ticker := time.NewTicker(45 * time.Second)
 		defer ticker.Stop()
@@ -429,7 +435,6 @@ func awsCloudShell(ctx context.Context, params awsCloudShellParams) {
 	initMap := make(map[string]any)
 	if params.initScriptPath != "" {
 		initMap = awsCloudShellInit(ctx, params.httpClient, params.creds, params.envID, params.initScriptPath)
-		log.Printf("initMap %v\n", initMap)
 	}
 
 	// https://github.com/aws/session-manager-plugin/blob/b2b0bcd769d1c0693f77047360748ed45b09a72b/src/sessionmanagerplugin/session/session.go#L121-L130
