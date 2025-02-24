@@ -19,13 +19,13 @@ import (
 	"os/signal"
 	"runtime/debug"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/config"
-	"golang.org/x/term"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/trace"
 )
 
 func init() {
@@ -82,8 +82,23 @@ func main() {
 	cfg := must(config.LoadDefaultConfig(ctx))
 	creds := must(cfg.Credentials.Retrieve(ctx))
 
-	hc := http.DefaultClient
-	hc.Jar = must(cookiejar.New(nil))
+	//hc := http.DefaultClient
+	hc := &http.Client{
+		Transport: otelhttp.NewTransport(
+			http.DefaultTransport,
+			otelhttp.WithSpanNameFormatter(func(operation string, r *http.Request) string {
+				if len(operation) > 0 {
+					return operation
+				}
+
+				return fmt.Sprintf("%s %s", r.Method, r.URL.Path)
+			}),
+		),
+		Jar: must(cookiejar.New(nil)),
+	}
+
+	cleanup := must(SetupTraceProvider(10 * time.Second))
+	defer cleanup()
 
 	// get login cookie
 	awsLogin(ctx, hc, creds)
@@ -145,6 +160,9 @@ func must[T any](ret T, err error) T {
 }
 
 func awsLogin(ctx context.Context, hc *http.Client, creds aws.Credentials) {
+	ctx, span := tracer.Start(ctx, "awsLogin", trace.WithNewRoot())
+	defer span.End()
+
 	signintokenURL := must(url.Parse("https://signin.aws.amazon.com/federation"))
 	signintokenURL.RawQuery = url.Values{
 		"Action":          []string{"getSigninToken"},
@@ -169,7 +187,7 @@ func awsLogin(ctx context.Context, hc *http.Client, creds aws.Credentials) {
 		"SigninToken": []string{signintokenMap["SigninToken"]},
 	}.Encode()
 	req = must(http.NewRequestWithContext(ctx, http.MethodGet, loginURL.String(), io.NopCloser(strings.NewReader(""))))
-	login := must(hc.Get(loginURL.String()))
+	login := must(hc.Do(req))
 	defer login.Body.Close()
 	_ = must(io.ReadAll(login.Body))
 }
@@ -246,8 +264,11 @@ func awsCloudShellSessionCleanup(ctx context.Context, hc *http.Client, cfg aws.C
 }
 
 func awsCloudShellEnvironment(ctx context.Context, hc *http.Client, tbcreds aws.Credentials, vpc vpcConfig) string {
+	ctx, span := tracer.Start(ctx, "awsCloudShellEnvironment", trace.WithNewRoot())
+	defer span.End()
+
 	// ???
-	req := must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/describeEnvironments",
+	req := must(http.NewRequestWithContext(ctx, http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/describeEnvironments",
 		io.NopCloser(strings.NewReader(""))))
 	res := must(hc.Do(must(v4sign(ctx, tbcreds, req))))
 	defer res.Body.Close()
@@ -260,7 +281,7 @@ func awsCloudShellEnvironment(ctx context.Context, hc *http.Client, tbcreds aws.
 		slog.InfoContext(ctx, "creating vpc-environment takes a few minutes")
 		body = string(must(json.Marshal(map[string]any{"VpcConfig": vpc, "EnvironmentName": "env-" + fmt.Sprint(time.Now().Unix())})))
 	}
-	req = must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/createEnvironment", io.NopCloser(strings.NewReader(body))))
+	req = must(http.NewRequestWithContext(ctx, http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/createEnvironment", io.NopCloser(strings.NewReader(body))))
 	res = must(hc.Do(must(v4sign(ctx, tbcreds, req))))
 	defer res.Body.Close()
 	bs = must(io.ReadAll(res.Body))
@@ -272,18 +293,21 @@ func awsCloudShellEnvironment(ctx context.Context, hc *http.Client, tbcreds aws.
 	status := envmap["Status"].(string)
 	for status != "RUNNING" {
 		func() {
-			time.Sleep(3 * time.Second)
-			sync.OnceFunc(func() {
-				req = must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/startEnvironment",
-					io.NopCloser(strings.NewReader(fmt.Sprintf(`{"EnvironmentId":"%s"}`, envID)))))
-				res = must(hc.Do(must(v4sign(ctx, tbcreds, req))))
-				defer res.Body.Close()
-				bs = must(io.ReadAll(res.Body))
-				slog.DebugContext(ctx, "startEnvironment", slog.String("body", string(bs)))
-				must0(json.Unmarshal(bs, &envmap))
-			})
+			//sync.OnceFunc(func() {
+			//	req = must(http.NewRequestWithContext(ctx, http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/startEnvironment",
+			//		io.NopCloser(strings.NewReader(fmt.Sprintf(`{"EnvironmentId":"%s"}`, envID)))))
+			//	res = must(hc.Do(must(v4sign(ctx, tbcreds, req))))
+			//	defer res.Body.Close()
+			//	bs = must(io.ReadAll(res.Body))
+			//	slog.DebugContext(ctx, "startEnvironment", slog.String("body", string(bs)))
+			//	must0(json.Unmarshal(bs, &envmap))
+			//})()
+			must0(makeSpan(ctx, "waiter", func() error {
+				time.Sleep(3 * time.Second)
+				return nil
+			}))
 
-			req = must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/getEnvironmentStatus",
+			req = must(http.NewRequestWithContext(ctx, http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/getEnvironmentStatus",
 				io.NopCloser(strings.NewReader(fmt.Sprintf(`{"EnvironmentId":"%s"}`, envID)))))
 			res = must(hc.Do(must(v4sign(ctx, tbcreds, req))))
 			defer res.Body.Close()
@@ -311,7 +335,7 @@ func awsCloudShellSession(ctx context.Context, hc *http.Client, tbcreds aws.Cred
 }
 
 func awsCloudShellInit(ctx context.Context, hc *http.Client, creds aws.Credentials, envID string, initFilePath string) map[string]any {
-	req := must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/getFileUploadUrls",
+	req := must(http.NewRequestWithContext(ctx, http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/getFileUploadUrls",
 		io.NopCloser(bytes.NewReader(must(json.Marshal(map[string]string{
 			"EnvironmentId":  envID,
 			"FileUploadPath": initFilePath,
@@ -337,7 +361,7 @@ func awsCloudShellInit(ctx context.Context, hc *http.Client, creds aws.Credentia
 	must(io.Copy(fw, file))
 	contentType := mw.FormDataContentType()
 	must0(mw.Close())
-	req = must(http.NewRequest(http.MethodPost, uploadInfoMap["FileUploadPresignedUrl"].(string), body))
+	req = must(http.NewRequestWithContext(ctx, http.MethodPost, uploadInfoMap["FileUploadPresignedUrl"].(string), body))
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Content-Length", fmt.Sprint(body.Len()))
 	//dr := must(httputil.DumpRequest(req, true))
@@ -351,10 +375,13 @@ func awsCloudShellInit(ctx context.Context, hc *http.Client, creds aws.Credentia
 }
 
 func heartbeat(ctx context.Context, params awsCloudShellParams) {
+	ctx, span := tracer.Start(ctx, "heartbeat", trace.WithNewRoot())
+	defer span.End()
+
 	// renew creds
 	creds := must(params.cfg.Credentials.Retrieve(ctx))
 	//log.Printf("retrieved credentials: access_key_id=%v expiration=%v", creds.AccessKeyID, creds.Expires)
-	req := must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/sendHeartBeat",
+	req := must(http.NewRequestWithContext(ctx, http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/sendHeartBeat",
 		io.NopCloser(strings.NewReader(fmt.Sprintf(`{"EnvironmentId":"%s"}`, params.envID)))))
 	res := must(params.httpClient.Do(must(v4sign(ctx, creds, req))))
 	defer res.Body.Close()
@@ -365,7 +392,7 @@ func heartbeat(ctx context.Context, params awsCloudShellParams) {
 		"codeVerifier":  []string{"R0r-XINZhRJqEkRk-2EjocwI2aqrhcjO6IlGRPYcIo0"},
 		"redirectUri":   []string{"https://auth.cloudshell.ap-northeast-1.aws.amazon.com/callback.js?state=1"},
 	}.Encode()
-	req = must(http.NewRequest(http.MethodGet, authURL.String(), io.NopCloser(strings.NewReader(""))))
+	req = must(http.NewRequestWithContext(ctx, http.MethodGet, authURL.String(), io.NopCloser(strings.NewReader(""))))
 	res = must(params.httpClient.Do(must(v4sign(ctx, creds, req))))
 	defer res.Body.Close()
 	bs := must(io.ReadAll(res.Body))
@@ -389,7 +416,7 @@ func heartbeat(ctx context.Context, params awsCloudShellParams) {
 	}
 	//log.Printf("keybase %s\n", keybase)
 
-	req = must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/redeemCode",
+	req = must(http.NewRequestWithContext(ctx, http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/redeemCode",
 		io.NopCloser(bytes.NewReader(must(json.Marshal(map[string]string{
 			"AuthCode":      oauthcode,
 			"CodeVerifier":  "cfd87ed2-16b3-432e-8278-e3afdfc6b235c1a6b90c-33e3-43a6-9801-02d742274b9c",
@@ -404,7 +431,7 @@ func heartbeat(ctx context.Context, params awsCloudShellParams) {
 	redeemcodemap := make(map[string]string)
 	must0(json.Unmarshal(bs, &redeemcodemap))
 
-	req = must(http.NewRequest(http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/putCredentials",
+	req = must(http.NewRequestWithContext(ctx, http.MethodPost, "https://cloudshell.ap-northeast-1.amazonaws.com/putCredentials",
 		io.NopCloser(bytes.NewReader(must(json.Marshal(map[string]string{
 			"EnvironmentId": params.envID,
 			"KeyBase":       keybase,
@@ -456,10 +483,11 @@ func awsCloudShell(ctx context.Context, params awsCloudShellParams) {
 	cmd.Stderr = os.Stderr
 
 	// disable local echo
-	oldState := must(term.MakeRaw(int(os.Stdin.Fd())))
-	defer term.Restore(int(os.Stdin.Fd()), oldState)
+	//oldState := must(term.MakeRaw(int(os.Stdin.Fd())))
+	//defer term.Restore(int(os.Stdin.Fd()), oldState)
 
-	cmd.Run()
-	term.Restore(int(os.Stdin.Fd()), oldState)
-	println()
+	//cmd.Run()
+	<-ctx.Done()
+	//term.Restore(int(os.Stdin.Fd()), oldState)
+	//println()
 }
